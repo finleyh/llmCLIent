@@ -78,24 +78,56 @@ this REPL  ──MCP/stdio──>  hexstrike_mcp.py  ──HTTP──>  hexstrik
 (LLM host)                 (MCP adapter)                (:8888 engine)            (real tools)
 ```
 
-1. Start the engine in a separate terminal (per HexStrike's install docs) and confirm it's
-   reachable at `http://localhost:8888`:
+**You must start HexStrike's engine before this client can connect to it.** `mcp connect`
+only launches the adapter (`hexstrike_mcp.py`); the adapter immediately tries to reach the
+engine over HTTP, so the engine has to be running and healthy first.
 
-   ```bash
-   python3 hexstrike_server.py
-   ```
+### Step 1 — install and start the HexStrike engine
 
-2. Register the adapter as a stdio server in this client and connect:
+Per HexStrike's own docs, in a **separate terminal**:
 
-   ```
-   mcpc> mcp add stdio hexstrike python3 /abs/path/hexstrike_mcp.py --server http://localhost:8888
-   mcpc> mcp connect hexstrike
-   mcpc> mcp tools
-   mcpc> chat scan localhost for open ports
-   ```
+```bash
+git clone https://github.com/0x4m4/hexstrike-ai.git
+cd hexstrike-ai
+python3 -m venv hexstrike-env
+source hexstrike-env/bin/activate
+pip3 install -r requirements.txt
 
-The adapter's tools are exposed to the remote LLM as `hexstrike__<tool>` functions and the
+# start the engine (defaults to port 8888; --debug for verbose logs)
+python3 hexstrike_server.py
+```
+
+Leave this running. (The actual security tools — nmap, nuclei, gobuster, etc. — must also
+be installed on that machine; the engine wraps whatever is present.)
+
+### Step 2 — confirm the engine is up
+
+```bash
+curl http://localhost:8888/health
+```
+
+Don't move on until this returns a healthy response. If it fails, the adapter in step 3
+will fail too.
+
+### Step 3 — connect from this client
+
+Note the **absolute path** to `hexstrike_mcp.py` inside the repo you cloned (and use the
+same venv's Python so its dependencies resolve):
+
+```
+mcpc> mcp add stdio hexstrike /abs/path/hexstrike-ai/hexstrike-env/bin/python3 /abs/path/hexstrike-ai/hexstrike_mcp.py --server http://localhost:8888
+mcpc> mcp connect hexstrike
+mcpc> mcp tools
+mcpc> chat scan localhost for open ports
+```
+
+`mcp connect` spawns the adapter, which initializes against the running engine and reports
+its tools. They're exposed to the remote LLM as `hexstrike__<tool>` functions and the
 tool-call loop dispatches them automatically — no code changes required.
+
+> If the engine runs on a different host (e.g. on your VM host while the client runs in a
+> guest), point `--server` at that address instead of `localhost`, e.g.
+> `--server http://192.168.56.1:8888`.
 
 **Caveats**
 
