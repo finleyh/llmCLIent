@@ -10,9 +10,19 @@ configured context budget by dropping the oldest non-system messages first.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator, Optional
 
 import httpx
+
+# Patterns local models use to emit a tool call as plain text instead of the
+# structured OpenAI `tool_calls` field. Different models use different tag names
+# (<tool_call>, <tools>, <tool>), so accept any of them; also fenced JSON blocks.
+# The JSON payload is always the LAST capture group of each pattern.
+_TOOLCALL_TAG_RE = re.compile(
+    r"<(tool_call|tools|tool)>\s*(\{.*?\})\s*</\1>", re.DOTALL | re.IGNORECASE
+)
+_FENCE_RE = re.compile(r"```(?:json|tool_code)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 try:
     import tiktoken
@@ -139,11 +149,107 @@ def trim_history(
     return system + kept
 
 
+def _normalize_call(obj: Any) -> Optional[dict[str, str]]:
+    """Coerce a parsed dict into {name, arguments(JSON string)} or None."""
+    if not isinstance(obj, dict):
+        return None
+    # Allow either flat {name, arguments} or nested {function:{...}}.
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+    name = fn.get("name") or fn.get("tool") or fn.get("tool_name")
+    if not name or not isinstance(name, str):
+        return None
+    args = fn.get("arguments")
+    if args is None:
+        args = fn.get("parameters", fn.get("args", {}))
+    if isinstance(args, str):
+        args_str = args
+    else:
+        try:
+            args_str = json.dumps(args)
+        except (TypeError, ValueError):
+            return None
+    return {"name": name, "arguments": args_str}
+
+
+def parse_text_tool_calls(
+    content: Optional[str],
+    valid_names: Optional[set[str]] = None,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Recover tool calls a model emitted as TEXT instead of structured tool_calls.
+
+    Handles ``<tool_call>{...}</tool_call>`` tags (Qwen/Hermes), fenced ```json
+    blocks, and a bare top-level JSON object. Returns (tool_calls, cleaned_content).
+    Only calls whose name is in ``valid_names`` (when provided) are accepted, so
+    incidental JSON in a normal answer is not mistaken for a call.
+    """
+    if not content:
+        return [], content
+
+    raw_candidates: list[str] = []
+    spans: list[tuple[int, int]] = []
+
+    for rx in (_TOOLCALL_TAG_RE, _FENCE_RE):
+        for m in rx.finditer(content):
+            raw_candidates.append(m.groups()[-1])  # JSON is the last capture group
+            spans.append((m.start(), m.end()))
+
+    # No tags/fences: try the whole content, or the first {...} blob, as JSON.
+    if not raw_candidates:
+        stripped = content.strip()
+        blob = stripped
+        if not stripped.startswith("{"):
+            brace = re.search(r"\{.*\}", stripped, re.DOTALL)
+            blob = brace.group(0) if brace else ""
+        if blob:
+            raw_candidates.append(blob)
+            idx = content.find(blob)
+            spans.append((idx, idx + len(blob)))
+
+    calls: list[dict[str, Any]] = []
+    used_spans: list[tuple[int, int]] = []
+    for raw, span in zip(raw_candidates, spans):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        norm = _normalize_call(obj)
+        if not norm:
+            continue
+        if valid_names is not None and norm["name"] not in valid_names:
+            continue
+        calls.append(
+            {
+                "id": f"call_{len(calls)}",
+                "type": "function",
+                "function": {"name": norm["name"], "arguments": norm["arguments"]},
+            }
+        )
+        used_spans.append(span)
+
+    if not calls:
+        return [], content
+
+    # Strip the consumed spans from the visible content.
+    cleaned = content
+    for start, end in sorted(used_spans, reverse=True):
+        cleaned = cleaned[:start] + cleaned[end:]
+    cleaned = cleaned.strip() or None
+    return calls, cleaned
+
+
 class LLMClient:
-    def __init__(self, base_url: str, model: str, auth_token: str, temperature: float = 0.7):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        auth_token: str,
+        temperature: float = 0.7,
+        parse_text_tool_calls: bool = True,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
+        self.parse_text_tool_calls = parse_text_tool_calls
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={
@@ -223,4 +329,15 @@ class LLMClient:
         message["content"] = "".join(content_parts) or None
         if tool_calls:
             message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        elif self.parse_text_tool_calls and message["content"]:
+            # Server returned no structured tool_calls — recover any the model
+            # emitted as text (common with mlx-lm and other local servers).
+            valid = None
+            if tools:
+                valid = {t["function"]["name"] for t in tools if t.get("type") == "function"}
+            recovered, cleaned = parse_text_tool_calls(message["content"], valid)
+            if recovered:
+                message["tool_calls"] = recovered
+                message["content"] = cleaned
+                yield {"type": "recovered_tool_calls", "count": len(recovered)}
         yield {"type": "done", "message": message}

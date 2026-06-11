@@ -51,7 +51,13 @@ class Repl:
         self.cfg = cfg
         self.console = Console()
         self.storage = Storage(cfg.db_path)
-        self.llm = LLMClient(cfg.base_url, cfg.model, cfg.auth_token, cfg.temperature)
+        self.llm = LLMClient(
+            cfg.base_url,
+            cfg.model,
+            cfg.auth_token,
+            cfg.temperature,
+            parse_text_tool_calls=cfg.parse_text_tool_calls,
+        )
         self.mcp = MCPManager()
         self.session_id: Optional[int] = None
         self.psession: PromptSession = PromptSession(
@@ -352,6 +358,7 @@ class Repl:
         t.add_row("auth_token", "set" if self.cfg.auth_token else "[red]unset[/]")
         t.add_row("max_context_tokens", str(self.cfg.max_context_tokens))
         t.add_row("max_tool_output_tokens", str(self.cfg.max_tool_output_tokens))
+        t.add_row("parse_text_tool_calls", str(self.cfg.parse_text_tool_calls))
         t.add_row("temperature", str(self.cfg.temperature))
         t.add_row("db_path", str(self.cfg.db_path))
         self.console.print(t)
@@ -362,7 +369,12 @@ class Repl:
         base = (
             "You are a helpful assistant running inside a CLI client. "
             "You may call MCP tools that are available, and use save_memory to "
-            "remember durable facts about the user."
+            "remember durable facts about the user.\n\n"
+            "When you decide to use a tool, actually invoke it — do not just describe "
+            "the command. If for any reason you cannot emit a native tool call, output "
+            "exactly one tool call as a single line of the form "
+            '<tool_call>{"name": "<tool_name>", "arguments": {<json args>}}</tool_call> '
+            "and nothing else, so the client can execute it."
         )
         if mems:
             facts = "\n".join(f"- {m['content']}" for m in mems)
@@ -396,6 +408,11 @@ class Repl:
                 for event in self.llm.stream_chat(history, tools=tools):
                     if event["type"] == "text":
                         self.console.print(event["data"], end="")
+                    elif event["type"] == "recovered_tool_calls":
+                        self.console.print(
+                            f"\n[yellow]·[/] recovered {event['count']} tool call(s) "
+                            f"from text output",
+                        )
                     elif event["type"] == "done":
                         assistant_msg = event["message"]
             except Exception as e:  # noqa: BLE001

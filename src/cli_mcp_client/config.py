@@ -23,6 +23,7 @@ class Config:
     max_context_tokens: int
     max_tool_output_tokens: int
     temperature: float
+    parse_text_tool_calls: bool
     db_path: Path
 
     @classmethod
@@ -33,6 +34,9 @@ class Config:
         max_ctx = int(os.getenv("LLM_MAX_CONTEXT_TOKENS", "128000"))
         max_tool_out = int(os.getenv("LLM_MAX_TOOL_OUTPUT_TOKENS", "4000"))
         temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+        parse_text_tc = os.getenv("LLM_PARSE_TEXT_TOOLCALLS", "1").lower() not in (
+            "0", "false", "no", "off",
+        )
         db_path = _expand(os.getenv("MCPC_DB_PATH", "~/.mcpc/mcpc.db"))
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return cls(
@@ -42,6 +46,7 @@ class Config:
             max_context_tokens=max_ctx,
             max_tool_output_tokens=max_tool_out,
             temperature=temperature,
+            parse_text_tool_calls=parse_text_tc,
             db_path=db_path,
         )
 
