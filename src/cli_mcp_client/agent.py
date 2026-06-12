@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 
 from rich.console import Console
 
+from . import ui
 from .config import Config
 from .llm import LLMClient, trim_history
 from .mcp_manager import MCPManager
@@ -174,13 +175,10 @@ class AgentRunner:
         sig_counts: dict[str, int] = {}
         status, summary, step = "max_steps", None, 0
 
-        self.console.print(
-            f"[bold red]▶ agent run {run_id}[/] — objective: [italic]{objective}[/]"
-        )
+        self.console.print(f"[bold red]▸ agent[/] [italic]{objective}[/] [dim](run {run_id})[/]")
 
         try:
             for step in range(1, self.cfg.agent_max_steps + 1):
-                self.console.rule(f"[dim]step {step}/{self.cfg.agent_max_steps}[/]", style="red")
                 assistant_msg = self._llm_step(session_id, memories, objective, tools)
 
                 content = assistant_msg.get("content")
@@ -192,6 +190,7 @@ class AgentRunner:
                     # Plain answer with no tool call — treat as implicit completion.
                     status, summary = "done", content or "(no summary)"
                     self.storage.add_run_step(run_id, step, "final", detail=summary)
+                    ui.answer(self.console, summary)
                     break
 
                 done = False
@@ -207,7 +206,8 @@ class AgentRunner:
                         status = "done" if args.get("success", True) else "failed"
                         summary = args.get("summary", "(no summary)")
                         self.storage.add_run_step(run_id, step, "final", detail=summary)
-                        self.console.print(f"[bold green]✔ task_complete:[/] {summary}")
+                        glyph = "[green]✔[/]" if status == "done" else "[red]✗[/]"
+                        self.console.print(f"\n{glyph} {summary}")
                         done = True
                         break
 
@@ -217,7 +217,7 @@ class AgentRunner:
                     if sig_counts[sig] >= _STALL_ABORT:
                         status, summary = "aborted", "aborted: repeated the same call too many times"
                         self.storage.add_run_step(run_id, step, "observation", detail=summary, tool_name=name)
-                        self.console.print(f"[red]✖ {summary}[/]")
+                        self.console.print(f"[red]✗[/] {summary}")
                         done = True
                         break
 
@@ -243,7 +243,7 @@ class AgentRunner:
             self.console.print("\n[yellow]⚠ interrupted[/]")
 
         self.storage.update_run(run_id, status=status, summary=summary, steps=step)
-        self.console.print(f"[bold]run {run_id} finished:[/] {status} — {summary}")
+        self.console.print(f"[dim]run {run_id}: {status} · {step} step(s)[/]")
         return run_id
 
     def _llm_step(self, session_id, memories, objective, tools) -> dict[str, Any]:
@@ -254,41 +254,37 @@ class AgentRunner:
             tools=tools,
             max_tool_output_tokens=self.cfg.max_tool_output_tokens,
         )
-        assistant_msg: dict[str, Any] = {}
-        self.console.print("[bold green]agent[/] ", end="")
-        for event in self.llm.stream_chat(history, tools=tools):
-            if event["type"] == "text":
-                self.console.print(event["data"], end="")
-            elif event["type"] == "recovered_tool_calls":
-                self.console.print(f"\n[yellow]·[/] recovered {event['count']} tool call(s) from text")
-            elif event["type"] == "done":
-                assistant_msg = event["message"]
-        self.console.print()
+        # Buffer the model's output (narration stays off-screen); only tool
+        # activity and the final summary are shown by the caller.
+        assistant_msg = ui.collect_stream(self.console, self.llm, history, tools)
         extra = {k: v for k, v in assistant_msg.items() if k not in ("role", "content")}
         self.storage.add_message(session_id, "assistant", assistant_msg.get("content"), extra or None)
         return assistant_msg
 
     def _run_tool(self, run_id, step, session_id, tc, name, args) -> None:
-        allowed, note = self._approve(name, args)
+        allowed, note = self._approve(name, args)  # may prompt the user
         self.storage.add_run_step(
             run_id, step, "tool",
             detail=json.dumps(args), tool_name=name,
             approved=allowed,
         )
-        self.console.print(f"[cyan]→ tool[/] {name} {args} [dim]({note})[/]")
 
         if not allowed:
             output = f"SKIPPED: tool '{name}' was not approved and did not run."
+            state = "denied" if "denied" in note else "skipped"
+            meta = note
         elif name == "save_memory":
             self.storage.add_memory(args.get("fact", ""))
-            output = f"saved: {args.get('fact', '')}"
+            output, state, meta = f"saved: {args.get('fact', '')}", "ok", "saved"
         else:
-            try:
-                output = self.mcp.call_tool(name, args)
-            except Exception as e:  # noqa: BLE001
-                output = f"ERROR: {e}"
+            with ui.running(self.console, name):
+                try:
+                    output = self.mcp.call_tool(name, args)
+                except Exception as e:  # noqa: BLE001
+                    output = f"ERROR: {e}"
+            state, meta = ui.output_meta(output)
 
-        self.console.print(f"[dim]{output[:500]}{'…' if len(output) > 500 else ''}[/]")
+        ui.tool_line(self.console, name, state, meta)
         self.storage.add_run_step(run_id, step, "observation", detail=output, tool_name=name)
         self.storage.add_message(
             session_id, "tool", output, {"tool_call_id": tc.get("id", ""), "name": name}

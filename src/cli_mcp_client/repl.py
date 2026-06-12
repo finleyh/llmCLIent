@@ -12,6 +12,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.table import Table
 
+from . import ui
 from .agent import ABORT, ALWAYS, MEMORY_TOOL, ONCE, SKIP, AgentRunner
 from .config import Config
 from .llm import LLMClient, trim_history
@@ -495,23 +496,11 @@ class Repl:
                 max_tool_output_tokens=self.cfg.max_tool_output_tokens,
             )
 
-            assistant_msg: dict[str, Any] = {}
-            self.console.print("[bold green]assistant[/] ", end="")
             try:
-                for event in self.llm.stream_chat(history, tools=tools):
-                    if event["type"] == "text":
-                        self.console.print(event["data"], end="")
-                    elif event["type"] == "recovered_tool_calls":
-                        self.console.print(
-                            f"\n[yellow]·[/] recovered {event['count']} tool call(s) "
-                            f"from text output",
-                        )
-                    elif event["type"] == "done":
-                        assistant_msg = event["message"]
+                assistant_msg = ui.collect_stream(self.console, self.llm, history, tools)
             except Exception as e:  # noqa: BLE001
-                self.console.print(f"\n[red]LLM error:[/] {e}")
+                self.console.print(f"[red]LLM error:[/] {e}")
                 return
-            self.console.print()  # newline after stream
 
             extra = {k: v for k, v in assistant_msg.items() if k not in ("role", "content")}
             self.storage.add_message(
@@ -520,8 +509,11 @@ class Repl:
 
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
-                return  # plain answer, done
+                # Plain answer: this is the only model text the user sees.
+                ui.answer(self.console, assistant_msg.get("content"))
+                return
 
+            # Intermediate narration is suppressed; only tool activity is shown.
             for tc in tool_calls:
                 self._handle_tool_call(tc)
 
@@ -533,19 +525,18 @@ class Repl:
         except json.JSONDecodeError:
             arguments = {}
 
-        self.console.print(f"[cyan]→ tool[/] {name} {arguments}")
-
         if name == "save_memory":
-            fact = arguments.get("fact", "")
-            self.storage.add_memory(fact)
-            output = f"saved: {fact}"
+            self.storage.add_memory(arguments.get("fact", ""))
+            output, state, meta = f"saved: {arguments.get('fact', '')}", "ok", "saved"
         else:
-            try:
-                output = self.mcp.call_tool(name, arguments)
-            except Exception as e:  # noqa: BLE001
-                output = f"ERROR: {e}"
+            with ui.running(self.console, name):
+                try:
+                    output = self.mcp.call_tool(name, arguments)
+                except Exception as e:  # noqa: BLE001
+                    output = f"ERROR: {e}"
+            state, meta = ui.output_meta(output)
 
-        self.console.print(f"[dim]{output[:500]}{'…' if len(output) > 500 else ''}[/]")
+        ui.tool_line(self.console, name, state, meta)
         self.storage.add_message(
             self.session_id,
             "tool",
