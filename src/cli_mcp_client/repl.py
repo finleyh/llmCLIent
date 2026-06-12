@@ -12,6 +12,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.table import Table
 
+from .agent import ABORT, ALWAYS, MEMORY_TOOL, ONCE, SKIP, AgentRunner
 from .config import Config
 from .llm import LLMClient, trim_history
 from .mcp_manager import MCPManager
@@ -22,26 +23,6 @@ BANNER = r"""
 + -- --=[ remote LLM + MCP servers, REPL edition        ]
 + -- --=[ type 'help' for commands                      ]
 """
-
-# Built-in tool the LLM can call to persist a durable fact across sessions.
-MEMORY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "save_memory",
-        "description": (
-            "Save a durable fact about the user or their preferences so it can be "
-            "recalled in future sessions. Use for stable info (name, role, "
-            "preferences, ongoing projects), not transient conversation details."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "fact": {"type": "string", "description": "The fact to remember, one sentence."}
-            },
-            "required": ["fact"],
-        },
-    },
-}
 
 PROMPT_STYLE = Style.from_dict({"prompt": "ansired bold"})
 
@@ -106,6 +87,7 @@ class Repl:
             "sessions": self.cmd_sessions,
             "session": self.cmd_session,
             "memory": self.cmd_memory,
+            "agent": self.cmd_agent,
             "mcp": self.cmd_mcp,
             "set": self.cmd_set,
             "clear": lambda a: self.console.clear(),
@@ -135,6 +117,9 @@ class Repl:
             ("memory list", "show saved long-term memories"),
             ("memory add <fact>", "manually save a memory"),
             ("memory del <id>", "delete a memory"),
+            ("agent run <objective>", "run an autonomous ReAct agent toward a goal"),
+            ("agent runs", "list past agent runs"),
+            ("agent show <id>", "show the step-by-step trace of a run"),
             ("mcp list", "list configured/connected MCP servers"),
             ("mcp add stdio <name> <cmd> [args...]", "add a stdio server"),
             ("mcp add sse <name> <url>", "add an SSE server"),
@@ -244,6 +229,110 @@ class Repl:
             self.console.print("[green]*[/] deleted")
         else:
             self.console.print(f"unknown memory subcommand: {sub}")
+
+    # ---- agent ----------------------------------------------------------
+    def cmd_agent(self, args) -> None:
+        if not args:
+            self.console.print("usage: agent run <objective> | agent runs | agent show <id>")
+            return
+        sub = args[0]
+        if sub == "run":
+            objective = " ".join(args[1:]).strip()
+            if not objective:
+                self.console.print("usage: agent run <objective>")
+                return
+            self._agent_run(objective)
+        elif sub == "runs":
+            self._agent_runs()
+        elif sub == "show":
+            if len(args) < 2 or not args[1].isdigit():
+                self.console.print("usage: agent show <id>")
+                return
+            self._agent_show(int(args[1]))
+        else:
+            self.console.print(f"unknown agent subcommand: {sub}")
+
+    def _agent_run(self, objective: str) -> None:
+        if self.cfg.missing():
+            self.console.print("[red]LLM not configured.[/] Set values in .env, then restart.")
+            return
+        self._ensure_session()
+        mode = "autonomous" if self.cfg.agent_auto_approve_all else "hybrid (will confirm writes)"
+        self.console.print(f"[dim]approval mode: {mode}; max steps: {self.cfg.agent_max_steps}[/]")
+        runner = AgentRunner(
+            self.cfg, self.console, self.llm, self.mcp, self.storage, self._confirm_tool
+        )
+        try:
+            runner.run(objective, self.session_id)
+        except Exception as e:  # noqa: BLE001
+            self.console.print(f"[red]agent error:[/] {e}")
+
+    def _confirm_tool(self, name: str, args: dict[str, Any], reason: str) -> str:
+        """Interactive approval prompt for a state-changing tool call (hybrid mode)."""
+        self.console.print(
+            f"[yellow]⚠ approval needed[/] [bold]{name}[/] [dim]({reason})[/]\n"
+            f"  args: {json.dumps(args)[:300]}"
+        )
+        while True:
+            try:
+                ans = self.psession.prompt(
+                    [("class:prompt", "  approve? [y]es / [a]lways / [s]kip / a[b]ort > ")],
+                    style=PROMPT_STYLE,
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return ABORT
+            if ans in ("y", "yes"):
+                return ONCE
+            if ans in ("a", "always"):
+                return ALWAYS
+            if ans in ("s", "skip", "n", "no"):
+                return SKIP
+            if ans in ("b", "abort", "q"):
+                return ABORT
+            self.console.print("  [dim]please answer y / a / s / b[/]")
+
+    def _agent_runs(self) -> None:
+        runs = self.storage.list_runs()
+        if not runs:
+            self.console.print("[dim]no agent runs yet[/]")
+            return
+        import time as _t
+        t = Table(show_header=True, header_style="bold red")
+        for col in ("id", "status", "steps", "objective", "updated"):
+            t.add_column(col)
+        for r in runs:
+            obj = r["objective"]
+            t.add_row(
+                str(r["id"]),
+                r["status"],
+                str(r["steps"]),
+                (obj[:50] + "…") if len(obj) > 50 else obj,
+                _t.strftime("%Y-%m-%d %H:%M", _t.localtime(r["updated_at"])),
+            )
+        self.console.print(t)
+
+    def _agent_show(self, run_id: int) -> None:
+        run = self.storage.get_run(run_id)
+        if not run:
+            self.console.print(f"[red]no such run: {run_id}[/]")
+            return
+        self.console.print(
+            f"[bold]run {run['id']}[/] — [italic]{run['objective']}[/]\n"
+            f"status: {run['status']}  steps: {run['steps']}"
+        )
+        if run["summary"]:
+            self.console.print(f"summary: {run['summary']}")
+        steps = self.storage.get_run_steps(run_id)
+        glyph = {"thought": "[blue]…[/]", "tool": "[cyan]→[/]", "observation": "[dim]←[/]", "final": "[green]✔[/]"}
+        for s in steps:
+            mark = glyph.get(s["kind"], " ")
+            label = f"[s{s['step']}] {mark} {s['kind']}"
+            if s["tool_name"]:
+                label += f" {s['tool_name']}"
+            if s["approved"] is not None:
+                label += " [green](approved)[/]" if s["approved"] else " [red](skipped)[/]"
+            detail = (s["detail"] or "").replace("\n", " ")
+            self.console.print(f"{label}: [dim]{detail[:200]}{'…' if len(detail) > 200 else ''}[/]")
 
     # ---- mcp ------------------------------------------------------------
     def _autoconnect_servers(self) -> None:
@@ -361,6 +450,10 @@ class Repl:
         t.add_row("parse_text_tool_calls", str(self.cfg.parse_text_tool_calls))
         t.add_row("temperature", str(self.cfg.temperature))
         t.add_row("db_path", str(self.cfg.db_path))
+        t.add_row("agent_max_steps", str(self.cfg.agent_max_steps))
+        t.add_row("agent_auto_approve_all", str(self.cfg.agent_auto_approve_all))
+        t.add_row("agent_allow", ", ".join(self.cfg.agent_allow) or "[dim]none[/]")
+        t.add_row("agent_deny", ", ".join(self.cfg.agent_deny) or "[dim]none[/]")
         self.console.print(t)
 
     # ---- chat -----------------------------------------------------------

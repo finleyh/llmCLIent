@@ -38,7 +38,30 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     created_at  REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    objective   TEXT NOT NULL,
+    status      TEXT NOT NULL,          -- running | done | failed | aborted | max_steps
+    summary     TEXT,                   -- final summary from task_complete (if any)
+    steps       INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_steps (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    step        INTEGER NOT NULL,       -- 1-based iteration number
+    kind        TEXT NOT NULL,          -- thought | tool | observation | final
+    tool_name   TEXT,                   -- set for kind=tool/observation
+    detail      TEXT,                   -- thought text / args JSON / observation text
+    approved    INTEGER,                -- 1/0/NULL: was the tool call approved?
+    ts          REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_runsteps_run ON run_steps(run_id, id);
 """
 
 
@@ -138,6 +161,67 @@ class Storage:
     def delete_memory(self, memory_id: int) -> None:
         self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self.conn.commit()
+
+    # ---- agent runs -----------------------------------------------------
+    def create_run(self, objective: str, session_id: Optional[int] = None) -> int:
+        now = time.time()
+        cur = self.conn.execute(
+            """INSERT INTO runs(session_id, objective, status, steps, created_at, updated_at)
+               VALUES (?,?,?,?,?,?)""",
+            (session_id, objective, "running", 0, now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_run(
+        self,
+        run_id: int,
+        status: Optional[str] = None,
+        summary: Optional[str] = None,
+        steps: Optional[int] = None,
+    ) -> None:
+        sets, vals = ["updated_at = ?"], [time.time()]
+        if status is not None:
+            sets.append("status = ?"); vals.append(status)
+        if summary is not None:
+            sets.append("summary = ?"); vals.append(summary)
+        if steps is not None:
+            sets.append("steps = ?"); vals.append(steps)
+        vals.append(run_id)
+        self.conn.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = ?", vals)
+        self.conn.commit()
+
+    def add_run_step(
+        self,
+        run_id: int,
+        step: int,
+        kind: str,
+        detail: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        approved: Optional[bool] = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO run_steps(run_id, step, kind, tool_name, detail, approved, ts)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                run_id, step, kind, tool_name, detail,
+                None if approved is None else int(approved), time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def list_runs(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def get_run(self, run_id: int) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+    def get_run_steps(self, run_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM run_steps WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
 
     # ---- mcp server configs --------------------------------------------
     def save_mcp_server(self, name: str, transport: str, config: dict[str, Any]) -> None:

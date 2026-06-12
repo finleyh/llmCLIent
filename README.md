@@ -39,6 +39,11 @@ uv run mcpc
 | `LLM_MAX_TOOL_OUTPUT_TOKENS` | cap per tool-result when re-sending history; `0` disables (default 4000) |
 | `LLM_TEMPERATURE` | sampling temperature (default 0.7) |
 | `MCPC_DB_PATH` | SQLite location (default `~/.mcpc/mcpc.db`) |
+| `AGENT_MAX_STEPS` | hard cap on agent reason→act→observe iterations (default 25) |
+| `AGENT_AUTO_APPROVE_ALL` | `1` = fully autonomous; never confirm before a tool runs (default `0`) |
+| `AGENT_READONLY_PREFIXES` | tool-name prefixes auto-approved in hybrid mode (overrides the default verb list) |
+| `AGENT_ALLOW` | comma-separated exact tool names to always auto-approve |
+| `AGENT_DENY` | comma-separated exact tool names to always block (overrides allow) |
 
 ## Commands
 
@@ -48,6 +53,9 @@ sessions              list saved sessions
 session new [name]    start a new session
 session resume <id>   load a past session
 memory list|add|del   manage long-term memory
+agent run <objective> run an autonomous ReAct agent toward a goal
+agent runs            list past agent runs
+agent show <id>       show the step-by-step trace of a run
 mcp add stdio <name> <cmd> [args...]
 mcp add sse   <name> <url>
 mcp connect <name>    connect a server
@@ -55,6 +63,32 @@ mcp tools             list connected tools
 set                   show LLM config
 exit                  quit
 ```
+
+## Agent mode
+
+`chat` is a single conversational turn (the model may chain tool calls, but you drive each
+turn). `agent run <objective>` instead hands the model a **goal** and lets it loop —
+reason, call a tool, read the result, repeat — until it calls the built-in `task_complete`
+tool or hits `AGENT_MAX_STEPS`.
+
+**Approval is hybrid by default.** Read-only tools (names starting `get`, `list`, `search`,
+`read`, …) run automatically; anything that looks state-changing pauses for confirmation:
+
+```
+mcpc> agent run find open ports on localhost and save a summary to notes.md
+⚠ approval needed srv__write_file (state-changing tool)
+  args: {"path": "notes.md", ...}
+  approve? [y]es / [a]lways / [s]kip / a[b]ort >
+```
+
+`always` auto-approves that tool for the rest of the run; `skip` feeds a "did not run" note
+back to the model; `abort` (or Ctrl-C) ends the run. Set `AGENT_AUTO_APPROVE_ALL=1` for
+fully autonomous runs, or use `AGENT_ALLOW` / `AGENT_DENY` for per-tool overrides.
+
+Every run is persisted: `agent runs` lists them and `agent show <id>` replays the full
+thought → tool → observation → final trace. Runs share the active session's history, so the
+agent sees prior conversation and long-term memories, and what it does is visible to later
+`chat` turns.
 
 ## Example: add a local stdio MCP server
 
